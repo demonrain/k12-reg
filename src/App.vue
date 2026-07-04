@@ -274,9 +274,9 @@
               </div>
               <label class="field">
                 <span>OpenAI 代理（必填）</span>
-                <input v-model.trim="form.defaultProxyUrl" placeholder="host:port 或 http://user:pass@host:port" />
+                <input v-model.trim="form.defaultProxyUrl" placeholder="host:port、http://user:pass@host:port，或轮询代理 API URL" />
                 <small :class="{invalid: form.defaultProxyUrl && !proxyConfigValid}">
-                  支持 host:port、username:password@host:port、http(s)://...、socks5://...，或 direct。
+                  支持 host:port、username:password@host:port、http(s)/socks5 静态代理、轮询代理 API（返回 host:port:user:pass，每任务换出口），或 direct。
                 </small>
               </label>
             </section>
@@ -636,7 +636,10 @@
               <button class="ghost small" :disabled="!selectedRepairableEmailIds.length" @click="repairSelectedAccessTokens">
                 修复AT {{ selectedRepairableEmailIds.length }}
               </button>
-              <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails">
+              <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails(1)">
+                分裂选中 x1
+              </button>
+              <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails()">
                 分裂选中 x{{ splitAliasCount || 4 }}
               </button>
               <button class="danger small" :disabled="!selectedEmailIds.length" @click="deleteSelectedEmails">
@@ -1100,9 +1103,13 @@ function isOpenAiProxyConfig(value: string): boolean {
   const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
   try {
     const url = new URL(hasScheme ? raw : `http://${raw}`);
+    if (!url.hostname) return false;
+    // http(s) 带 path/query 视为轮询代理 API（返回 host:port:user:pass）
+    if (hasScheme && /^https?:$/i.test(url.protocol) && ((url.pathname && url.pathname !== "/") || url.search || url.hash)) {
+      return true;
+    }
     return Boolean(
-      url.hostname
-      && (!url.pathname || url.pathname === "/")
+      (!url.pathname || url.pathname === "/")
       && !url.search
       && !url.hash
       && (hasScheme || Boolean(url.port)),
@@ -1119,7 +1126,7 @@ const launchTaskCount = computed(() => {
   return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter((item) => item.status === "free").length);
 });
 const proxyConfigValid = computed(() => isOpenAiProxyConfig(form.defaultProxyUrl));
-const proxyConfigError = "请先配置 OpenAI 代理，支持 host:port、username:password@host:port、http(s)://...、socks5://...，或 direct";
+const proxyConfigError = "请先配置 OpenAI 代理，支持静态代理、轮询代理 API（返回 host:port:user:pass），或 direct";
 const startTasksDisabled = computed(() => busy.value || !proxyConfigValid.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
 const selectedRunnableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
@@ -1540,9 +1547,9 @@ function selectParentEmails() {
   showToast(`已选择母邮箱 ${selectedEmailIds.value.length} 个`);
 }
 
-async function splitSelectedEmails() {
+async function splitSelectedEmails(perParent?: number) {
   if (!selectedEmailIds.value.length) return;
-  const count = Math.max(1, Math.min(50, Number(splitAliasCount.value) || 4));
+  const count = Math.max(1, Math.min(50, Number(perParent ?? splitAliasCount.value) || 4));
   const ok = window.confirm(`确认将选中的 ${selectedEmailIds.value.length} 个邮箱按每个 ${count} 个子邮箱分裂？子邮箱会复用母邮箱接码地址。`);
   if (!ok) return;
   const result = await api<any>("/api/emails/split", {

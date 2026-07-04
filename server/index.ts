@@ -176,6 +176,8 @@ interface K12Task {
   jsonOutFormat?: JsonOutFormat;
   platformFeeCaptured?: boolean;
   platformFeeCapturedAt?: string;
+  proxyRaw?: string;
+  proxyExitIp?: string;
   waitingOtp?: boolean;
   waitingOtpLabel?: string;
   waitingOtpEmail?: string;
@@ -370,7 +372,18 @@ function asNumber(value: unknown, fallback: number, min = Number.NEGATIVE_INFINI
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
-const PROXY_CONFIG_HINT = "host:port、username:password@host:port、http://host:port、http://username:password@host:port、socks5://host:port，或 direct";
+const PROXY_CONFIG_HINT = "host:port、username:password@host:port、http://host:port、http://username:password@host:port、socks5://host:port、轮询代理 API（http(s)://... 返回 host:port:user:pass），或 direct";
+
+interface ProxyConfig {
+  raw: string;
+  dispatcherUrl: string;
+  direct: boolean;
+  rotate: boolean;
+}
+
+interface ResolvedTaskProxy extends ProxyConfig {
+  exitIp: string;
+}
 
 function requiredProxyConfigError(): string {
   return `请先在设置中配置 OpenAI 代理，支持 ${PROXY_CONFIG_HINT}`;
@@ -380,20 +393,28 @@ function invalidProxyConfigError(): string {
   return `OpenAI 代理格式不正确，支持 ${PROXY_CONFIG_HINT}`;
 }
 
-function normalizeProxyConfig(value: unknown): {raw: string; dispatcherUrl: string; direct: boolean} | null {
+function isRotateProxyApiUrl(url: URL): boolean {
+  if (!/^https?:$/i.test(url.protocol)) return false;
+  return Boolean((url.pathname && url.pathname !== "/") || url.search || url.hash);
+}
+
+function normalizeProxyConfig(value: unknown): ProxyConfig | null {
   const raw = asString(value);
   if (!raw) return null;
-  if (raw.toLowerCase() === "direct") return {raw: "direct", dispatcherUrl: "", direct: true};
+  if (raw.toLowerCase() === "direct") return {raw: "direct", dispatcherUrl: "", direct: true, rotate: false};
   if (/\s/.test(raw)) return null;
   const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
   const urlText = hasScheme ? raw : `http://${raw}`;
   try {
     const url = new URL(urlText);
     if (!url.hostname) return null;
+    if (hasScheme && isRotateProxyApiUrl(url)) {
+      return {raw, dispatcherUrl: "", direct: false, rotate: true};
+    }
     if ((url.pathname && url.pathname !== "/") || url.search || url.hash) return null;
     if (!hasScheme && !url.port) return null;
     const normalized = url.toString().replace(/\/$/g, "");
-    return {raw: normalized, dispatcherUrl: normalized, direct: false};
+    return {raw: normalized, dispatcherUrl: normalized, direct: false, rotate: false};
   } catch {
     return null;
   }
@@ -403,11 +424,23 @@ function proxyUrlForDispatcher(value: unknown): string {
   const raw = asString(value);
   if (!raw || raw.toLowerCase() === "direct") return "";
   const proxy = normalizeProxyConfig(raw);
-  return proxy?.dispatcherUrl || raw;
+  if (!proxy || proxy.rotate || proxy.direct) return "";
+  return proxy.dispatcherUrl;
 }
 
 function maskProxyForLog(value: unknown): string {
-  const urlValue = proxyUrlForDispatcher(value);
+  const raw = asString(value);
+  if (!raw || raw.toLowerCase() === "direct") return "direct";
+  const configured = normalizeProxyConfig(raw);
+  if (configured?.rotate) {
+    try {
+      const url = new URL(raw);
+      return `${url.origin}${url.pathname}?[轮询代理API]`;
+    } catch {
+      return "rotate-api";
+    }
+  }
+  const urlValue = configured?.dispatcherUrl || proxyUrlForDispatcher(raw);
   if (!urlValue) return "direct";
   try {
     const url = new URL(urlValue);
@@ -423,10 +456,122 @@ function proxyUrlForClient(proxy: {dispatcherUrl: string; direct: boolean}): str
   return proxy.direct ? "" : proxy.dispatcherUrl;
 }
 
-function assertTenantProxyConfigured(): {raw: string; dispatcherUrl: string; direct: boolean} {
+function assertTenantProxyConfigured(): ProxyConfig {
   const proxy = normalizeProxyConfig(tenantState().appConfig?.defaultProxyUrl);
   if (!proxy) throw new Error(requiredProxyConfigError());
   return proxy;
+}
+
+function parseHostPortUserPassProxy(text: string): ProxyConfig {
+  const line = text.trim().split(/\r?\n/).map((item) => item.trim()).find(Boolean) || "";
+  const cleaned = line.replace(/^["']|["']$/g, "").trim();
+  const parts = cleaned.split(":");
+  if (parts.length < 4) {
+    throw new Error(`轮询代理 API 返回格式无效，期望 host:port:user:pass，实际: ${cleaned.slice(0, 120)}`);
+  }
+  const host = parts[0];
+  const port = parts[1];
+  const username = parts[2];
+  const password = parts.slice(3).join(":");
+  if (!host || !/^\d+$/.test(port) || !username) {
+    throw new Error(`轮询代理 API 返回格式无效，期望 host:port:user:pass，实际: ${cleaned.slice(0, 120)}`);
+  }
+  const dispatcherUrl = `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+  return {raw: dispatcherUrl, dispatcherUrl, direct: false, rotate: true};
+}
+
+async function fetchRotateProxyFromApi(apiUrl: string): Promise<ProxyConfig> {
+  const response = await undiciFetch(apiUrl, {
+    method: "GET",
+    headers: {
+      accept: "text/plain, */*",
+      "user-agent": "k12-reg-rotate-proxy/1.0",
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const text = await response.text().catch(() => "");
+  if (!response.ok) {
+    throw new Error(`轮询代理 API 请求失败: HTTP ${response.status} ${text.slice(0, 180)}`);
+  }
+  return parseHostPortUserPassProxy(text);
+}
+
+async function probeProxyExitIp(dispatcherUrl: string): Promise<string> {
+  if (!dispatcherUrl) return "";
+  const endpoints = [
+    "https://api.ipify.org?format=text",
+    "https://ifconfig.me/ip",
+    "http://api.ipify.org?format=text",
+  ];
+  const dispatcher = new ProxyAgent(dispatcherUrl);
+  for (const endpoint of endpoints) {
+    try {
+      const response = await undiciFetch(endpoint, {
+        method: "GET",
+        dispatcher,
+        headers: {accept: "text/plain"},
+        signal: AbortSignal.timeout(12_000),
+      });
+      const text = (await response.text()).trim();
+      if (!response.ok) continue;
+      const ip = text.split(/\s+/)[0] || "";
+      if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip) || /^[0-9a-f:]+$/i.test(ip)) return ip;
+    } catch {
+      // try next endpoint
+    }
+  }
+  return "";
+}
+
+async function resolveTaskProxy(task?: K12Task, options: {forceRefresh?: boolean} = {}): Promise<ResolvedTaskProxy> {
+  const configured = assertTenantProxyConfigured();
+  if (!configured.rotate) {
+    let exitIp = task?.proxyExitIp || "";
+    if (!configured.direct && (!exitIp || options.forceRefresh)) {
+      exitIp = await probeProxyExitIp(configured.dispatcherUrl).catch(() => "");
+    }
+    const resolved: ResolvedTaskProxy = {...configured, exitIp};
+    if (task) {
+      task.proxyRaw = resolved.raw;
+      task.proxyExitIp = resolved.exitIp || undefined;
+    }
+    return resolved;
+  }
+
+  // 轮询代理：同一任务默认复用已分配出口；forceRefresh 时重新取号
+  if (!options.forceRefresh && task?.proxyRaw) {
+    const cached = normalizeProxyConfig(task.proxyRaw);
+    if (cached && !cached.rotate && !cached.direct) {
+      return {
+        raw: task.proxyRaw,
+        dispatcherUrl: cached.dispatcherUrl,
+        direct: false,
+        rotate: true,
+        exitIp: task.proxyExitIp || "",
+      };
+    }
+  }
+
+  const fetched = await fetchRotateProxyFromApi(configured.raw);
+  const exitIp = await probeProxyExitIp(fetched.dispatcherUrl).catch(() => "");
+  const resolved: ResolvedTaskProxy = {...fetched, exitIp};
+  if (task) {
+    task.proxyRaw = resolved.dispatcherUrl;
+    task.proxyExitIp = resolved.exitIp || undefined;
+  }
+  return resolved;
+}
+
+function logResolvedProxy(task: K12Task, proxy: ResolvedTaskProxy): void {
+  if (proxy.direct) {
+    appendLog(task, "info", "OpenAI 代理已启用: direct");
+    return;
+  }
+  const endpoint = maskProxyForLog(proxy.dispatcherUrl || proxy.raw);
+  const exit = proxy.exitIp ? ` 出口IP=${proxy.exitIp}` : " 出口IP=未知";
+  appendLog(task, "info", proxy.rotate
+    ? `OpenAI 轮询代理已启用: ${endpoint}${exit}`
+    : `OpenAI 代理已启用: ${endpoint}${exit}`);
 }
 
 function parseStringList(value: unknown): string[] {
@@ -3387,10 +3532,18 @@ async function loginChatGptWebWithFreshSession(task: K12Task, email: EmailRecord
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     assertNotCanceled(task);
-    let client = await createOpenAIClientForEmail(task, email);
+    // 首次复用任务代理；invalid_state 重试时轮询代理重新取号换出口
+    let client = await createOpenAIClientForEmail(task, email, {refreshProxy: attempt > 1});
     try {
       if (attempt > 1) {
         appendLog(task, "warn", `重新创建浏览器会话后登录 (${attempt}/3)`);
+        if (assertTenantProxyConfigured().rotate) {
+          appendLog(
+            task,
+            "info",
+            `OpenAI 轮询代理已切换: ${maskProxyForLog(task.proxyRaw || "")} 出口IP=${task.proxyExitIp || "未知"}`,
+          );
+        }
       }
       const accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
       return {client, accessToken};
@@ -5583,8 +5736,8 @@ async function getAuthSessionCandidates(client: any): Promise<Record<string, unk
   return candidates;
 }
 
-async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Promise<any> {
-  const proxy = assertTenantProxyConfigured();
+async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord, options: {refreshProxy?: boolean} = {}): Promise<any> {
+  const proxy = await resolveTaskProxy(task, {forceRefresh: options.refreshProxy === true});
   await ensureSentinelSdk();
   const {OpenAIClient, generateRandomDeviceProfile, MailboxUrlCodeProvider} = await loadBundleModules();
   let baseline: unknown = null;
@@ -6099,8 +6252,8 @@ async function runTask(task: K12Task): Promise<void> {
 
   try {
     await runTaskStep(task, "prepare", async () => {
-      const proxy = assertTenantProxyConfigured();
-      appendLog(task, "info", `OpenAI 代理已启用: ${maskProxyForLog(proxy.raw)}`);
+      const proxy = await resolveTaskProxy(task, {forceRefresh: true});
+      logResolvedProxy(task, proxy);
       await ensureSentinelSdk();
     });
 
@@ -6298,8 +6451,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
-    const proxy = assertTenantProxyConfigured();
-    appendLog(task, "info", `OpenAI 代理已启用: ${maskProxyForLog(proxy.raw)}`);
+    const proxy = await resolveTaskProxy(task, {forceRefresh: true});
+    logResolvedProxy(task, proxy);
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
     const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
     appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
