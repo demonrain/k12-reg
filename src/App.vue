@@ -300,6 +300,7 @@
                 <label class="field">
                   <span>密码</span>
                   <input v-model="form.sub2apiPassword" type="password" :placeholder="passwordPlaceholder" />
+                  <small v-if="sub2apiPasswordSaved">已保存密码：{{ sub2apiPasswordMasked || "已隐藏" }}，留空保存不会覆盖。</small>
                 </label>
                 <label class="field">
                   <span>分组（可多个）</span>
@@ -1028,6 +1029,8 @@ const importingData = ref(false);
 const startingSub2apiRefill = ref(false);
 const smsBowerApiKeySaved = ref(false);
 const smsBowerApiKeyMasked = ref("");
+const sub2apiPasswordSaved = ref(false);
+const sub2apiPasswordMasked = ref("");
 const smsBowerBackendUnsupported = ref(false);
 const smsBowerAccount = reactive<SmsBowerAccountStatus>({
   enabled: false,
@@ -1142,7 +1145,11 @@ const taskPageStart = computed(() => (taskPage.value - 1) * taskPageSize);
 const taskPageEnd = computed(() => Math.min(sortedTasks.value.length, taskPageStart.value + taskPageSize));
 const pagedTasks = computed(() => sortedTasks.value.slice(taskPageStart.value, taskPageEnd.value));
 const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
-const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
+const passwordPlaceholder = computed(() => (
+  form.sub2apiPassword
+    ? "已填写"
+    : (sub2apiPasswordSaved.value ? "已保存密码，留空则不修改" : "填写 Sub2API 密码")
+));
 const smsBowerApiKeyPlaceholder = computed(() => form.smsBowerApiKey || smsBowerApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 SMSBower API Key");
 const smsBowerBalanceText = computed(() => {
   if (!form.smsBowerMailEnabled) return "未启用";
@@ -1240,6 +1247,7 @@ async function loadConfig() {
     sub2apiEmail: config.sub2apiEmail || "",
     sub2apiPassword: "",
     sub2apiGroupName: config.sub2apiGroupName || "k12",
+    // secrets 不回填明文，靠 Present 标记提示已保存
     sub2apiProxyName: config.sub2apiProxyName || "",
     sub2apiAccountPriority: config.sub2apiAccountPriority || 1,
     sub2apiConcurrency: config.sub2apiConcurrency || 10,
@@ -1266,6 +1274,8 @@ async function loadConfig() {
   });
   smsBowerApiKeySaved.value = Boolean(config.smsBowerApiKeyPresent);
   smsBowerApiKeyMasked.value = config.smsBowerApiKeyMasked || "";
+  sub2apiPasswordSaved.value = Boolean(config.sub2apiPasswordPresent);
+  sub2apiPasswordMasked.value = config.sub2apiPasswordMasked || "";
   workspaceText.value = (config.workspaceIds || []).join("\n");
 }
 

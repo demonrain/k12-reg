@@ -1,7 +1,7 @@
 ﻿import {AsyncLocalStorage} from "node:async_hooks";
 import {createHash, randomInt, randomUUID} from "node:crypto";
 import {existsSync} from "node:fs";
-import {mkdir, readFile, stat, unlink, writeFile} from "node:fs/promises";
+import {mkdir, readFile, rename, stat, unlink, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -553,7 +553,14 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), {recursive: true});
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const payload = `${JSON.stringify(value, null, 2)}\n`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, payload, "utf8");
+  await rename(tempPath, filePath).catch(async () => {
+    // Windows 上目标存在时 rename 可能失败，回退直接覆盖写
+    await writeFile(filePath, payload, "utf8");
+    await unlink(tempPath).catch(() => undefined);
+  });
 }
 
 function defaultPlatformShareState(): PlatformShareState {
@@ -631,7 +638,8 @@ function createTenantRuntime(id: string): TenantRuntime {
     tasksFile: isDefault ? legacyTasksFile : path.join(dir, "tasks.json"),
     sub2apiRefillHistoryFile: isDefault ? legacySub2apiRefillHistoryFile : path.join(dir, "sub2api-refill-history.json"),
     platformShareStateFile: path.join(dir, "platform-share-state.json"),
-    compatConfigFile: isDefault ? legacyCompatConfigFile : path.join(dir, "config.json"),
+    // compat 必须与主配置分文件，否则会互相覆盖导致重启丢配置
+    compatConfigFile: isDefault ? legacyCompatConfigFile : path.join(dir, "compat-config.json"),
     defaultJsonOutDir: isDefault ? defaultJsonOutDir : path.join(dir, "json"),
     defaultTokenOut: isDefault ? path.join(rootDir, "pool_tokens.txt") : path.join(dir, "pool_tokens.txt"),
     appConfig: undefined as unknown as AppConfig,
@@ -856,8 +864,13 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
   };
 }
 
+function serializeAppConfig(config: AppConfig): AppConfig {
+  // 只持久化业务配置字段，避免 compat 杂项写回主配置
+  return normalizeConfig(config);
+}
+
 async function saveConfig(next: AppConfig): Promise<void> {
-  tenantState().appConfig = normalizeConfig(next);
+  tenantState().appConfig = serializeAppConfig(next);
   await writeJson(tenantState().configFile, tenantState().appConfig);
   await ensureCompatBundleConfig();
   configureSub2ApiRefillTimer();
@@ -2251,13 +2264,37 @@ function removeEmails(ids: string[]): {removed: number; skippedRunning: number; 
   return {removed, skippedRunning, missing};
 }
 
+function normalizeMailboxRoot(value: string): string {
+  const email = String(value || "").trim().toLowerCase();
+  const at = email.lastIndexOf("@");
+  if (at <= 0) return email;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  return `${local.split("+")[0]}@${domain}`;
+}
+
 function rootMailboxIdentity(email: EmailRecord): string {
-  return (email.parentEmail || email.email).toLowerCase();
+  // 母邮箱与 plus 子号共享接码箱，必须串行，避免验证码串号
+  const source = email.smsBowerMailRoot || email.parentEmail || email.email;
+  return normalizeMailboxRoot(source);
 }
 
 function rootMailboxIdentityByEmailId(emailId: string): string {
   const email = tenantState().emails.find((item) => item.id === emailId);
-  return email ? rootMailboxIdentity(email) : emailId;
+  return email ? rootMailboxIdentity(email) : normalizeMailboxRoot(emailId);
+}
+
+function runningMailboxRoots(): Set<string> {
+  const roots = new Set<string>();
+  for (const task of tenantState().tasks) {
+    if (task.status !== "running") continue;
+    roots.add(rootMailboxIdentityByEmailId(task.emailId));
+  }
+  for (const email of tenantState().emails) {
+    if (email.status !== "running") continue;
+    roots.add(rootMailboxIdentity(email));
+  }
+  return roots;
 }
 
 function randomAliasSuffix(length = 6): string {
@@ -2403,7 +2440,9 @@ function isEmailOtpSendStepError(error: unknown): boolean {
     : typeof error === "object" && error && "message" in error
       ? String((error as {message?: unknown}).message || "")
       : String(error);
-  return message.includes(AUTH_EMAIL_OTP_SEND_URL) || /email-otp\/send/i.test(message);
+  return message.includes(AUTH_EMAIL_OTP_SEND_URL)
+    || message.includes(AUTH_PASSWORDLESS_SEND_OTP_URL)
+    || /email-otp\/send|passwordless\/send-otp|EmailOtpSendLogin/i.test(message);
 }
 
 function authStepFromError(error: unknown): string {
@@ -3003,27 +3042,40 @@ async function ensureChatGptCsrfCookie(client: any): Promise<void> {
 }
 
 async function sendEmailOtpForLogin(client: any, task?: K12Task, referer = `${AUTH_BASE_URL}/log-in/password`): Promise<string> {
-  return runOpenAiAuthRequest(task, "PasswordlessSendOtp", async () => {
-  const response = await client.fetch(AUTH_PASSWORDLESS_SEND_OTP_URL, {
-    method: "POST",
-    headers: oauthBrowserHeaders(client, {
+  // 对齐 FrciblyK12：优先 GET /api/accounts/email-otp/send，passwordless 易 invalid_state
+  return runOpenAiAuthRequest(task, "EmailOtpSendLogin", async () => {
+    const commonHeaders = oauthBrowserHeaders(client, {
       accept: "application/json",
-      "content-type": "application/json",
-      origin: AUTH_BASE_URL,
       referer,
       "sec-fetch-dest": "empty",
       "sec-fetch-mode": "cors",
       "sec-fetch-site": "same-origin",
-    }),
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`PasswordlessSendOtp 请求失败: HTTP ${response.status} ${body.slice(0, 500)}`);
-  }
-  const payload = (await response.json()) as {continue_url?: string; page?: {payload?: {url?: string}}};
-  const nextUrl = String(payload.page?.payload?.url || payload.continue_url || `${AUTH_BASE_URL}/email-verification`);
-  return new URL(nextUrl, AUTH_BASE_URL).toString();
-  });
+    });
+    let response = await client.fetch(AUTH_EMAIL_OTP_SEND_URL, {
+      method: "GET",
+      headers: commonHeaders,
+    });
+    if (!response.ok && (response.status === 404 || response.status === 405)) {
+      response = await client.fetch(AUTH_EMAIL_OTP_SEND_URL, {
+        method: "POST",
+        headers: {...commonHeaders, "content-type": "application/json", origin: AUTH_BASE_URL},
+        body: "{}",
+      });
+    }
+    if (!response.ok) {
+      response = await client.fetch(AUTH_PASSWORDLESS_SEND_OTP_URL, {
+        method: "POST",
+        headers: {...commonHeaders, "content-type": "application/json", origin: AUTH_BASE_URL},
+      });
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`EmailOtpSendLogin 请求失败: HTTP ${response.status} ${body.slice(0, 500)}`);
+    }
+    const payload = (await response.json().catch(() => ({}))) as {continue_url?: string; page?: {payload?: {url?: string}}};
+    const nextUrl = String(payload.page?.payload?.url || payload.continue_url || `${AUTH_BASE_URL}/email-verification`);
+    return new URL(nextUrl, AUTH_BASE_URL).toString();
+  }, {restartOnInvalidState: true});
 }
 
 async function sendEmailOtpForSignup(client: any, task?: K12Task, referer = AUTH_CREATE_ACCOUNT_PASSWORD_URL): Promise<string> {
@@ -3221,8 +3273,15 @@ async function continueAuthSteps(
   for (let step = 0; step < 12; step += 1) {
     log("info", `OpenAI auth step: ${continueUrl}`);
 
-    if (continueUrl === `${AUTH_BASE_URL}/log-in/password`) {
-      log("warn", "当前账号进入密码页；按配置不提交密码，尝试改走邮箱验证码登录");
+    if (continueUrl.startsWith(`${AUTH_BASE_URL}/error`)) {
+      if (/rate_limit/i.test(continueUrl)) {
+        throw new Error("OpenAI auth rate_limit_exceeded：登录请求过于频繁，请降低并发后重试");
+      }
+      throw new Error(`OpenAI auth 错误页: ${safeUrlForLog(continueUrl)}`);
+    }
+
+    if (continueUrl === `${AUTH_BASE_URL}/log-in/password` || continueUrl.startsWith(`${AUTH_BASE_URL}/log-in/password?`)) {
+      log("warn", "当前账号进入密码页；按配置不提交密码，改走邮箱验证码登录");
       try {
         continueUrl = await sendEmailOtpForLogin(client, task, `${AUTH_BASE_URL}/log-in/password`);
       } catch (error) {
@@ -3307,77 +3366,24 @@ async function loginAuthFlowWithEmailOtp(
   return continueAuthSteps(client, continueUrl, task, options);
 }
 
+async function resumeLoginFromAuthEntry(
+  client: any,
+  task: K12Task,
+  reason: string,
+  level: "info" | "warn" = "warn",
+): Promise<string> {
+  appendLog(task, level, reason);
+  const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
+  await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
+  appendLog(task, "info", "读取 https://chatgpt.com/api/auth/session accessToken");
+  return String(await client.getChatGPTAccessToken());
+}
+
 async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emailAddress: string): Promise<string> {
   assertNotCanceled(task);
   appendLog(task, "info", `登录 ChatGPT Web session: ${emailAddress}`);
-  await ensureChatGptCsrfCookie(client);
-  try {
-    await runOpenAiAuthRequest(task, "ChatGPTWebLogin", () => client.authLoginChatGPTWeb(), {restartOnInvalidState: true});
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (isInvalidAuthStateError(error)) {
-      appendLog(task, "warn", "登录 auth session 已失效，重新打开 ChatGPT auth 入口后接管流程");
-      const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
-      await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
-    } else if (isInvalidPasswordError(error)) {
-      appendLog(task, "warn", "登录流程进入密码验证失败；按配置改走邮箱验证码登录");
-      await continueAuthSteps(client, `${AUTH_BASE_URL}/log-in/password`, task, {finishChatGptCallback: true});
-    } else if (isEmailOtpSendStepError(error)) {
-      appendLog(task, "warn", "登录流程要求邮箱验证码，开始邮件接码");
-      await continueAuthSteps(client, authStepFromError(error) || AUTH_EMAIL_OTP_SEND_URL, task, {finishChatGptCallback: true});
-    } else if (message.includes(AUTH_WORKSPACE_URL)) {
-      appendLog(task, "warn", "登录流程停在 workspace 选择页，自动选择 K12 空间");
-      await continueAuthSteps(client, AUTH_WORKSPACE_URL, task, {finishChatGptCallback: true});
-    } else if (authStepFromError(error)) {
-      appendLog(task, "warn", `接管 OpenAI auth step: ${authStepFromError(error)}`);
-      await continueAuthSteps(client, authStepFromError(error), task, {finishChatGptCallback: true});
-    } else if (!/__Host-next-auth\.csrf-token|csrf-token/i.test(message)) {
-      throw error;
-    } else {
-      appendLog(task, "warn", "首次未拿到 ChatGPT csrf cookie，刷新 /api/auth/csrf 后重试一次");
-      await client.fetch(`${CHATGPT_BASE_URL}/api/auth/csrf`, {
-        method: "GET",
-        headers: oauthBrowserHeaders(client, {
-          accept: "application/json",
-          referer: `${CHATGPT_BASE_URL}/`,
-          "sec-fetch-dest": "empty",
-          "sec-fetch-mode": "cors",
-          "sec-fetch-site": "same-origin",
-        }),
-      });
-      try {
-        await runOpenAiAuthRequest(task, "ChatGPTWebLoginRetry", () => client.authLoginChatGPTWeb(), {restartOnInvalidState: true});
-      } catch (retryError) {
-        if (isInvalidAuthStateError(retryError)) {
-          appendLog(task, "warn", "重试后 auth session 仍失效，重新打开 ChatGPT auth 入口后接管流程");
-          const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
-          await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
-        }
-        if (isEmailOtpSendStepError(retryError)) {
-          appendLog(task, "warn", "重试后进入邮箱验证码流程，开始邮件接码");
-          await continueAuthSteps(client, authStepFromError(retryError) || AUTH_EMAIL_OTP_SEND_URL, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
-        }
-        if (String(retryError instanceof Error ? retryError.message : retryError).includes(AUTH_WORKSPACE_URL)) {
-          appendLog(task, "warn", "重试后停在 workspace 选择页，自动选择 K12 空间");
-          await continueAuthSteps(client, AUTH_WORKSPACE_URL, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
-        }
-        if (authStepFromError(retryError)) {
-          appendLog(task, "warn", `重试后接管 OpenAI auth step: ${authStepFromError(retryError)}`);
-          await continueAuthSteps(client, authStepFromError(retryError), task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
-        }
-        if (!isInvalidPasswordError(retryError)) throw retryError;
-        appendLog(task, "warn", "重试后仍进入密码验证失败；按配置改走邮箱验证码登录");
-        await continueAuthSteps(client, `${AUTH_BASE_URL}/log-in/password`, task, {finishChatGptCallback: true});
-        return String(await client.getChatGPTAccessToken());
-      }
-    }
-  }
-  appendLog(task, "info", "读取 https://chatgpt.com/api/auth/session accessToken");
-  return String(await client.getChatGPTAccessToken());
+  // 直接走 ChatGPT auth 入口（对齐成功路径 / FrciblyK12 显式发码），避免 ChatGPTWebLogin + passwordless 空转
+  return resumeLoginFromAuthEntry(client, task, "打开 ChatGPT auth 入口并接管登录流程", "info");
 }
 
 async function loginChatGptWebWithFreshSession(task: K12Task, email: EmailRecord): Promise<{client: any; accessToken: string}> {
@@ -3604,7 +3610,7 @@ async function followK12WorkspaceSelection(client: any, task: K12Task, nextUrl: 
 }
 
 async function openChatGptAuthEntryForWorkspaceSwitch(client: any, task: K12Task): Promise<string> {
-  appendLog(task, "info", "复用当前 ChatGPT cookie 打开 auth 入口，刷新 workspace/select 会话");
+  appendLog(task, "info", "打开 ChatGPT auth 入口，重建 auth session");
   await client.fetch(`${CHATGPT_BASE_URL}/`, {
     method: "GET",
     redirect: "follow",
@@ -6056,13 +6062,20 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
   return latestToken;
 }
 
+async function releaseTaskWorkerSlot(): Promise<void> {
+  tenantState().activeWorkers = Math.max(0, tenantState().activeWorkers - 1);
+  await Promise.all([persistTasks(), persistEmails()]).catch(() => undefined);
+  scheduleTasks();
+}
+
 async function runTask(task: K12Task): Promise<void> {
   const email = tenantState().emails.find((item) => item.id === task.emailId);
   if (!email) {
     task.status = "failed";
     task.error = "邮箱记录不存在";
     task.finishedAt = nowIso();
-    await persistTasks();
+    task.updatedAt = nowIso();
+    await releaseTaskWorkerSlot();
     return;
   }
   if (email.status === "banned") {
@@ -6071,12 +6084,12 @@ async function runTask(task: K12Task): Promise<void> {
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
     appendLog(task, "error", task.error);
-    await persistTasks();
+    await releaseTaskWorkerSlot();
     return;
   }
 
   task.status = "running";
-  task.startedAt = nowIso();
+  task.startedAt = task.startedAt || nowIso();
   task.updatedAt = nowIso();
   task.step = "prepare";
   task.stepStatus = "pending";
@@ -6265,7 +6278,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.status = "failed";
     task.error = "邮箱记录不存在";
     task.finishedAt = nowIso();
-    await persistTasks();
+    task.updatedAt = nowIso();
+    await releaseTaskWorkerSlot();
     return;
   }
   if (email.status === "banned") {
@@ -6274,12 +6288,12 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
     appendLog(task, "error", task.error);
-    await persistTasks();
+    await releaseTaskWorkerSlot();
     return;
   }
 
   task.status = "running";
-  task.startedAt = nowIso();
+  task.startedAt = task.startedAt || nowIso();
   task.updatedAt = nowIso();
   email.status = "running";
   email.lastTaskId = task.id;
@@ -6429,11 +6443,8 @@ function scheduleTasks(): void {
     appendLog(task, "error", task.error);
   }
   while (tenantState().activeWorkers < limit) {
-    const activeRoots = new Set(
-      tenantState().tasks
-        .filter((item) => item.status === "running")
-        .map((item) => rootMailboxIdentityByEmailId(item.emailId)),
-    );
+    // 只锁正在跑的母邮箱；queued 可排队，同母邮箱/plus 子号串行执行
+    const activeRoots = runningMailboxRoots();
     const task = tenantState().tasks.find((item) => (
       item.status === "queued"
       && !item.cancelRequested
@@ -6442,6 +6453,16 @@ function scheduleTasks(): void {
       && !taskWorkspaceCoolingMessage(item)
     ));
     if (!task) break;
+    // 同步认领，避免 concurrency>1 时同一 queued 任务被启动多次
+    task.status = "running";
+    task.startedAt = task.startedAt || nowIso();
+    task.updatedAt = nowIso();
+    const email = tenantState().emails.find((item) => item.id === task.emailId);
+    if (email && email.status !== "banned") {
+      email.status = "running";
+      email.lastTaskId = task.id;
+      email.updatedAt = nowIso();
+    }
     activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
     const tenant = tenantState();
     tenant.activeWorkers += 1;
