@@ -2285,14 +2285,11 @@ function rootMailboxIdentityByEmailId(emailId: string): string {
 }
 
 function runningMailboxRoots(): Set<string> {
+  // 只看真正在跑的任务。enqueue 时 email.status 会先标 running，不能据此加锁，否则 queued 任务永远选不中。
   const roots = new Set<string>();
   for (const task of tenantState().tasks) {
     if (task.status !== "running") continue;
     roots.add(rootMailboxIdentityByEmailId(task.emailId));
-  }
-  for (const email of tenantState().emails) {
-    if (email.status !== "running") continue;
-    roots.add(rootMailboxIdentity(email));
   }
   return roots;
 }
@@ -6430,7 +6427,7 @@ function scheduleTasks(): void {
     }
   }
   scheduleWorkspaceCircuitWakeup();
-  if (openAiAuthCooldownRemainingMs() > 0) return;
+  // auth 熔断只在请求层等待，不在这里阻塞整队启动，避免任务静默卡在 queued
   const limit = Math.max(1, tenantState().appConfig.taskConcurrency);
   for (const task of tenantState().tasks) {
     if (task.status !== "queued") continue;
