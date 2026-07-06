@@ -307,6 +307,7 @@ const platformShareDir = asString(process.env.K12_PLATFORM_SHARE_DIR)
   : "";
 const platformShareRatio = asNumber(process.env.K12_PLATFORM_SHARE_RATIO, 5, 2, 1000);
 const OPENAI_AUTH_MIN_INTERVAL_MS = 2500;
+const OPENAI_AUTH_WORKSPACE_SWITCH_INTERVAL_MS = 800;
 const OPENAI_AUTH_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const OPENAI_AUTH_TRANSIENT_COOLDOWN_MS = 20_000;
 const OPENAI_AUTH_UNSUPPORTED_COUNTRY_COOLDOWN_MS = 30 * 60 * 1000;
@@ -2838,10 +2839,18 @@ async function waitForOpenAiAuthSpacing(task?: K12Task): Promise<void> {
   else await sleep(waitMs);
 }
 
-function recordOpenAiAuthSuccess(): void {
+function openAiAuthSpacingForLabel(label: string): number {
+  if (/^(K12Workspace|WorkspaceSwitch|ChatGptSignInOpenAi|ChatGPTCallback)/.test(label)) {
+    return OPENAI_AUTH_WORKSPACE_SWITCH_INTERVAL_MS;
+  }
+  return OPENAI_AUTH_MIN_INTERVAL_MS;
+}
+
+function recordOpenAiAuthSuccess(label?: string): void {
+  const intervalMs = label ? openAiAuthSpacingForLabel(label) : OPENAI_AUTH_MIN_INTERVAL_MS;
   tenantState().openAiAuthCircuit = {
     failureCount: 0,
-    nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
+    nextAvailableAt: new Date(Date.now() + intervalMs).toISOString(),
     updatedAt: nowIso(),
   };
   scheduleOpenAiAuthCircuitWakeup();
@@ -2895,7 +2904,7 @@ async function runOpenAiAuthRequest<T>(
       if (task) appendLog(task, "info", `OpenAI auth 请求: ${label} (${attempt}/${OPENAI_AUTH_MAX_ATTEMPTS})`);
       try {
         const result = await fn();
-        recordOpenAiAuthSuccess();
+        recordOpenAiAuthSuccess(label);
         return result;
       } catch (error) {
         lastError = error;
@@ -3818,18 +3827,27 @@ async function checkK12WorkspaceMembership(client: any, task: K12Task, accessTok
   }
 }
 
-async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: string, referer = AUTH_WORKSPACE_URL): Promise<string | null> {
+async function selectK12AuthWorkspace(
+  client: any,
+  task: K12Task,
+  workspaceId: string,
+  referer = AUTH_WORKSPACE_URL,
+  options: {skipPage?: boolean} = {},
+): Promise<string | null> {
   appendLog(task, "info", `auth workspace/select(K12): ${workspaceId}`);
-  await runOpenAiAuthRequest<Response>(task, "K12WorkspacePage", () => client.fetch(AUTH_WORKSPACE_URL, {
-    method: "GET",
-    redirect: "manual",
-    headers: oauthBrowserHeaders(client, {
-      referer: AUTH_BASE_URL,
-      "sec-fetch-dest": "document",
-      "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "same-origin",
-    }),
-  }) as Promise<Response>).catch(() => undefined);
+  const onWorkspacePage = referer === AUTH_WORKSPACE_URL || referer.startsWith(`${AUTH_WORKSPACE_URL}?`);
+  if (!options.skipPage && !onWorkspacePage) {
+    await runOpenAiAuthRequest<Response>(task, "K12WorkspacePage", () => client.fetch(AUTH_WORKSPACE_URL, {
+      method: "GET",
+      redirect: "manual",
+      headers: oauthBrowserHeaders(client, {
+        referer: AUTH_BASE_URL,
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+      }),
+    }) as Promise<Response>).catch(() => undefined);
+  }
 
   const response = await runOpenAiAuthRequest<Response>(task, "K12WorkspaceSelect", () => client.fetch(AUTH_WORKSPACE_SELECT_URL, {
     method: "POST",
@@ -3973,7 +3991,7 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
       return;
     }
     if (currentUrl === AUTH_WORKSPACE_URL || currentUrl.startsWith(`${AUTH_WORKSPACE_URL}?`)) {
-      const selectedUrl = await selectK12AuthWorkspace(client, task, workspaceId, currentUrl);
+      const selectedUrl = await selectK12AuthWorkspace(client, task, workspaceId, currentUrl, {skipPage: true});
       if (!selectedUrl) return;
       currentUrl = selectedUrl;
       continue;
@@ -4036,21 +4054,16 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
 async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, accessToken: string, workspaceId: string): Promise<string | null> {
   if (isK12AccessTokenForWorkspace(accessToken, workspaceId)) return accessToken;
 
-  appendLog(task, "warn", `当前 Web AT 不是目标 K12 workspace，尝试 workspace/select 切换: ${describeAccessTokenContext(accessToken)} -> ${workspaceId.slice(0, 8)}...`);
+  appendLog(task, "info", `切换 K12 workspace AT: ${describeAccessTokenContext(accessToken)} -> ${workspaceId.slice(0, 8)}...`);
   try {
-    const nextUrl = await selectK12AuthWorkspace(client, task, workspaceId);
-    if (!nextUrl) return null;
-    await followK12WorkspaceSelection(client, task, nextUrl);
+    const refreshedUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
+    await runWorkspaceSwitchAuthFlow(client, task, refreshedUrl, workspaceId);
   } catch (error) {
     if (isInvalidWorkspaceSelectedError(error)) {
       appendLog(task, "warn", `auth workspace/select 跳过无效 workspace ${workspaceId.slice(0, 8)}...`);
       return null;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    if (!isInvalidAuthStateError(error)) throw error;
-    appendLog(task, "warn", "当前 auth session 已失效；改为复用 ChatGPT cookie 刷新 auth session 后直接切 K12");
-    const refreshedUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
-    await runWorkspaceSwitchAuthFlow(client, task, refreshedUrl, workspaceId);
+    throw error;
   }
 
   let latestToken = "";
@@ -4061,7 +4074,7 @@ async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, acces
       `workspace/select ${workspaceId.slice(0, 8)}... 后 第 ${attempt}/${K12_WORKSPACE_SWITCH_TOKEN_RETRIES} 次`,
     );
     if (isK12AccessTokenForWorkspace(latestToken, workspaceId)) return latestToken;
-    if (attempt < K12_WORKSPACE_SWITCH_TOKEN_RETRIES) await sleep(1000);
+    if (attempt < K12_WORKSPACE_SWITCH_TOKEN_RETRIES) await sleep(500);
   }
   appendLog(task, "warn", `workspace/select 后 session AT 仍不是目标 K12 workspace，跳过 ${workspaceId.slice(0, 8)}...: ${describeAccessTokenContext(latestToken || accessToken)}`);
   return null;
@@ -4082,7 +4095,6 @@ async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessTok
       await persistTasks();
       if (!invite.result.ok) continue;
     }
-    await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
     const switchedToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
     if (!switchedToken || !isK12AccessTokenForWorkspace(switchedToken, workspaceId)) {
       appendLog(task, "warn", `noRT 跳过无效 workspace ${workspaceId.slice(0, 8)}...`);
@@ -4498,7 +4510,6 @@ async function exportK12WorkspaceAccessTokens(
     await appendTokenOut(latestToken);
     exportedEntries.push({accessToken: latestToken, workspaceId});
     await writeAccountJsonFile(task, email, latestToken, {...accountOutputOptions, workspaceId});
-    if (index < workspaceIds.length - 1) await sleep(tenantState().appConfig.joinIntervalMs);
   }
   if (!exportedEntries.length) {
     appendLog(task, "warn", "所有 workspace 导出均被跳过，保留当前 Web AT");
@@ -6476,8 +6487,6 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
   let latestToken = accessToken;
   appendLog(task, "info", `K12 join 目标 ${targetCount} 个 workspace，候选池 ${candidatePool.length} 个`);
   await ensureChatGptOriginReady(client);
-  latestToken = await readChatGptSessionAccessToken(client, task, "K12 workspace join 前刷新 Web AT");
-  recordAccessToken(task, email, latestToken);
 
   for (const workspaceId of candidatePool) {
     if (successfulK12WorkspaceIds(task).length >= targetCount) break;
@@ -6488,9 +6497,7 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
     const invite = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
     latestToken = invite.accessToken;
     task.workspaceResults.push(invite.result);
-    await persistTasks();
     if (invite.result.ok) {
-      await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
       appendLog(task, "ok", `K12 workspace 加入成功 ${successfulK12WorkspaceIds(task).length}/${targetCount}: ${workspaceId.slice(0, 8)}...`);
     } else {
       appendLog(task, "warn", `K12 workspace 加入失败，跳过 ${workspaceId.slice(0, 8)}...，继续尝试下一个`);
@@ -6499,6 +6506,7 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
       await sleep(tenantState().appConfig.joinIntervalMs);
     }
   }
+  await persistTasks();
 
   const joinedIds = successfulK12WorkspaceIds(task);
   task.workspaceIds = joinedIds;
