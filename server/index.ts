@@ -37,6 +37,7 @@ interface AppConfig {
   route: K12Route;
   joinIntervalMs: number;
   joinMaxRetries: number;
+  k12WorkspaceExportLimit: number;
   taskConcurrency: number;
   runWorkspaceJoin: boolean;
   runSub2Api: boolean;
@@ -173,6 +174,8 @@ interface K12Task {
   workspaceResults: K12WorkspaceResult[];
   sub2apiAccount?: string;
   jsonOutFile?: string;
+  jsonOutFiles?: string[];
+  jsonOutBundleFile?: string;
   jsonOutFormat?: JsonOutFormat;
   platformFeeCaptured?: boolean;
   platformFeeCapturedAt?: string;
@@ -917,6 +920,7 @@ async function defaultConfig(): Promise<AppConfig> {
     route: "request",
     joinIntervalMs: 1500,
     joinMaxRetries: 2,
+    k12WorkspaceExportLimit: 5,
     taskConcurrency: 1,
     runWorkspaceJoin: true,
     runSub2Api: true,
@@ -974,6 +978,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     route,
     joinIntervalMs: asNumber(raw.joinIntervalMs, 1500, 0, 600000),
     joinMaxRetries: asNumber(raw.joinMaxRetries, 2, 0, 10),
+    k12WorkspaceExportLimit: asNumber(raw.k12WorkspaceExportLimit, 5, 1, 20),
     taskConcurrency: asNumber(raw.taskConcurrency, 1, 1, 10),
     runWorkspaceJoin: asBoolean(raw.runWorkspaceJoin, true),
     runSub2Api: asBoolean(raw.runSub2Api, true),
@@ -2250,6 +2255,10 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     workspaceResults,
     sub2apiAccount: asString(record.sub2apiAccount) || undefined,
     jsonOutFile: asString(record.jsonOutFile) || undefined,
+    jsonOutFiles: Array.isArray(record.jsonOutFiles)
+      ? record.jsonOutFiles.map((item) => asString(item)).filter(Boolean)
+      : undefined,
+    jsonOutBundleFile: asString(record.jsonOutBundleFile) || undefined,
     jsonOutFormat: record.jsonOutFormat ? normalizeJsonOutFormat(record.jsonOutFormat) : undefined,
     platformFeeCaptured: asBoolean(record.platformFeeCaptured, false) || undefined,
     platformFeeCapturedAt: asString(record.platformFeeCapturedAt) || undefined,
@@ -2970,10 +2979,49 @@ function scheduleWorkspaceCircuitWakeup(): void {
   }, Math.min(Math.max(1000, nextMs - Date.now() + 250), 300_000));
 }
 
-function pickAvailableWorkspaceId(workspaceIds: string[]): string {
+function shuffleWorkspaceCandidates(workspaceIds: string[]): string[] {
   const candidates = uniqueStringList(workspaceIds);
   const available = candidates.filter((workspaceId) => !isWorkspaceCoolingDown(workspaceId));
-  return randomItem(available.length ? available : candidates) || "";
+  const pool = available.length ? available : candidates;
+  return [...pool].sort(() => Math.random() - 0.5);
+}
+
+function k12WorkspaceJoinTargetCount(): number {
+  return Math.max(1, tenantState().appConfig.k12WorkspaceExportLimit);
+}
+
+function successfulK12WorkspaceIds(task: K12Task): string[] {
+  const seen = new Set<string>();
+  const joined: string[] = [];
+  for (const workspaceId of task.workspaceIds) {
+    if (seen.has(workspaceId)) continue;
+    if (hasSuccessfulK12WorkspaceResult(task, workspaceId)) {
+      seen.add(workspaceId);
+      joined.push(workspaceId);
+    }
+  }
+  for (const result of task.workspaceResults) {
+    if (!result.ok || result.route !== task.route || seen.has(result.workspaceId)) continue;
+    seen.add(result.workspaceId);
+    joined.push(result.workspaceId);
+  }
+  return joined;
+}
+
+function buildK12WorkspaceJoinPool(task: K12Task): string[] {
+  return uniqueStringList([
+    ...task.workspaceIds,
+    ...tenantState().appConfig.workspaceIds,
+  ]);
+}
+
+function isInvalidWorkspaceSelectedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid_workspace_selected|Invalid workspace selected/i.test(message);
+}
+
+function isInvalidWorkspaceSelectedResponse(status: number, body: string): boolean {
+  return status === 401 && /invalid_workspace_selected|Invalid workspace selected/i.test(body);
 }
 
 function taskWorkspaceCoolingMessage(task: K12Task): string {
@@ -3017,26 +3065,25 @@ async function waitForWorkspaceCircuit(task: K12Task, workspaceId: string): Prom
   await sleepForTask(task, Math.min(remaining, 300_000));
 }
 
-async function sendK12Invite(task: K12Task, client: any, accessToken: string, workspaceId: string, route: K12Route): Promise<K12WorkspaceResult> {
+async function sendK12Invite(
+  task: K12Task,
+  client: any,
+  accessToken: string,
+  workspaceId: string,
+  route: K12Route,
+): Promise<{result: K12WorkspaceResult; accessToken: string}> {
   let last: K12WorkspaceResult | null = null;
+  let currentToken = accessToken;
   await waitForWorkspaceCircuit(task, workspaceId);
+  await ensureChatGptOriginReady(client);
   for (let attempt = 1; attempt <= tenantState().appConfig.joinMaxRetries + 1; attempt += 1) {
     assertNotCanceled(task);
-    const url = `https://chatgpt.com/backend-api/accounts/${encodeURIComponent(workspaceId)}/invites/${route}`;
+    const url = `${CHATGPT_BASE_URL}/backend-api/accounts/${encodeURIComponent(workspaceId)}/invites/${route}`;
     appendLog(task, "info", `K12 ${route}: POST ${workspaceId.slice(0, 8)}... 第 ${attempt} 次`);
     try {
       const response = await client.fetch(url, {
         method: "POST",
-        headers: {
-          accept: "*/*",
-          authorization: `Bearer ${accessToken}`,
-          "content-type": "application/json",
-          origin: CHATGPT_BASE_URL,
-          referer: `${CHATGPT_BASE_URL}/`,
-          "oai-device-id": randomUUID(),
-          "oai-language": "zh-CN",
-          "user-agent": "Mozilla/5.0 K12SpaceConsole/0.1",
-        },
+        headers: buildK12InviteHeaders(client, currentToken),
         body: "",
       });
       const body = await response.text();
@@ -3051,9 +3098,19 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
       if (response.ok) {
         appendLog(task, "ok", `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}`);
         recordWorkspaceCircuitResult(task, last);
-        return last;
+        return {result: last, accessToken: currentToken};
       }
-      appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}: ${body.slice(0, 180)}`);
+      const blocked = isChatGptHtmlBlockResponse(response.status, body);
+      appendLog(
+        task,
+        "warn",
+        `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}${blocked ? "（边缘风控 HTML 拦截）" : ""}: ${body.slice(0, 180)}`,
+      );
+      if ((response.status === 401 || response.status === 403 || blocked) && attempt <= tenantState().appConfig.joinMaxRetries) {
+        appendLog(task, "warn", "K12 invite 被拒绝，刷新 ChatGPT Web session AT 后重试");
+        await ensureChatGptOriginReady(client);
+        currentToken = await readChatGptSessionAccessToken(client, task, `K12 invite 重试 ${workspaceId.slice(0, 8)}...`);
+      }
     } catch (error) {
       last = {workspaceId, route, ok: false, status: 0, body: error instanceof Error ? error.message : String(error), attempt};
       appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... 网络错误: ${last.body}`);
@@ -3062,7 +3119,7 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
   }
   const result = last || {workspaceId, route, ok: false, status: 0, body: "未执行", attempt: 0};
   recordWorkspaceCircuitResult(task, result);
-  return result;
+  return {result, accessToken: currentToken};
 }
 
 function latestK12WorkspaceResult(task: K12Task, workspaceId: string): K12WorkspaceResult | undefined {
@@ -3083,29 +3140,39 @@ function formatK12WorkspaceFailure(task: K12Task, workspaceId: string): string {
   return `${label} ${status}${body}（第 ${result.attempt} 次）`;
 }
 
-function k12WorkspaceJoinFailureMessage(task: K12Task, workspaceIds = targetK12WorkspaceIds(task)): string {
-  if (!workspaceIds.length) {
-    return "K12 workspace 未配置，任务判定失败";
+function k12WorkspaceJoinFailureMessage(task: K12Task): string {
+  const target = k12WorkspaceJoinTargetCount();
+  const joined = successfulK12WorkspaceIds(task);
+  if (joined.length) {
+    return `K12 ${task.route} 仅成功 ${joined.length}/${target} 个 workspace`;
   }
-  const failed = workspaceIds
+  const tried = uniqueStringList(task.workspaceResults.map((item) => item.workspaceId));
+  if (!tried.length) {
+    return "K12 workspace 未配置或未尝试，任务判定失败";
+  }
+  const failed = tried
     .filter((workspaceId) => !hasSuccessfulK12WorkspaceResult(task, workspaceId))
     .map((workspaceId) => formatK12WorkspaceFailure(task, workspaceId));
-  return `K12 ${task.route} 未成功，任务判定失败：${failed.join("；")}`;
+  return `K12 ${task.route} 未成功加入任何 workspace，任务判定失败：${failed.join("；")}`;
 }
 
-function assertK12WorkspaceJoinSucceeded(task: K12Task, workspaceIds = targetK12WorkspaceIds(task)): void {
+function assertK12WorkspaceJoinSucceeded(task: K12Task): void {
   if (!task.runWorkspaceJoin) return;
-  if (!workspaceIds.length || workspaceIds.some((workspaceId) => !hasSuccessfulK12WorkspaceResult(task, workspaceId))) {
-    throw new Error(k12WorkspaceJoinFailureMessage(task, workspaceIds));
+  const joined = successfulK12WorkspaceIds(task);
+  if (!joined.length) {
+    throw new Error(k12WorkspaceJoinFailureMessage(task));
+  }
+  const target = k12WorkspaceJoinTargetCount();
+  if (joined.length < target) {
+    appendLog(task, "warn", `K12 成功加入 ${joined.length}/${target} 个 workspace，已跳过失败项并继续`);
   }
 }
 
 function reconcileCompletedWorkspaceJoinTasks(): void {
   for (const task of tenantState().tasks) {
     if (task.status !== "success" || !task.runWorkspaceJoin || task.workspaceResults.length === 0) continue;
-    const workspaceIds = targetK12WorkspaceIds(task);
-    if (workspaceIds.length && workspaceIds.every((workspaceId) => hasSuccessfulK12WorkspaceResult(task, workspaceId))) continue;
-    const message = k12WorkspaceJoinFailureMessage(task, workspaceIds);
+    if (successfulK12WorkspaceIds(task).length) continue;
+    const message = k12WorkspaceJoinFailureMessage(task);
     task.status = "failed";
     task.error = message;
     task.updatedAt = nowIso();
@@ -3181,6 +3248,56 @@ async function ensureChatGptCsrfCookie(client: any): Promise<void> {
       "sec-fetch-site": "same-origin",
     }),
   }).catch(() => undefined);
+}
+
+async function ensureChatGptOriginReady(client: any): Promise<void> {
+  await client.fetch(`${CHATGPT_BASE_URL}/`, {
+    method: "GET",
+    redirect: "follow",
+    headers: oauthBrowserHeaders(client, {
+      "accept-encoding": "gzip, deflate, br",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+    }),
+  }).catch(() => undefined);
+  await ensureChatGptCsrfCookie(client);
+  if (!client.deviceID && typeof client.readCookie === "function") {
+    client.deviceID = asString(await client.readCookie(CHATGPT_BASE_URL, "oai-did").catch(() => ""))
+      || asString(await client.readCookie("https://openai.com", "oai-did").catch(() => ""))
+      || randomUUID();
+  }
+}
+
+function resolveChatGptDeviceId(client: any): string {
+  return asString(client?.deviceID) || randomUUID();
+}
+
+function isChatGptHtmlBlockResponse(status: number, body: string): boolean {
+  return (status === 403 || status === 503) && /<html[\s>]/i.test(body);
+}
+
+function buildK12InviteHeaders(client: any, accessToken: string): Record<string, string> {
+  const tokenInfo = summarizeToken(accessToken);
+  const payload = decodeJwtPayload(accessToken);
+  const sessionId = asString(payload.session_id, randomUUID());
+  const invitePath = `/backend-api/accounts/{id}/invites/{route}`;
+  return oauthBrowserHeaders(client, {
+    accept: "*/*",
+    authorization: `Bearer ${accessToken}`,
+    "content-type": "application/json",
+    ...(tokenInfo.accountId ? {"chatgpt-account-id": tokenInfo.accountId} : {}),
+    "oai-device-id": resolveChatGptDeviceId(client),
+    "oai-language": client?.deviceProfile?.acceptLanguage?.split(",")[0] || "zh-CN",
+    "oai-session-id": sessionId,
+    "x-openai-target-path": invitePath,
+    "x-openai-target-route": invitePath,
+    origin: CHATGPT_BASE_URL,
+    referer: `${CHATGPT_BASE_URL}/`,
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+  });
 }
 
 async function sendEmailOtpForLogin(client: any, task?: K12Task, referer = `${AUTH_BASE_URL}/log-in/password`): Promise<string> {
@@ -3611,6 +3728,12 @@ function isK12AccessToken(accessToken: string, task: K12Task): boolean {
   return plan === "k12" || (!!tokenInfo.accountId && targetIds.has(tokenInfo.accountId.toLowerCase()));
 }
 
+function isK12AccessTokenForWorkspace(accessToken: string, workspaceId: string): boolean {
+  const tokenInfo = summarizeToken(accessToken);
+  const plan = tokenInfo.planType.toLowerCase();
+  return plan === "k12" && tokenInfo.accountId?.toLowerCase() === workspaceId.toLowerCase();
+}
+
 function describeAccessTokenContext(accessToken: string): string {
   const tokenInfo = summarizeToken(accessToken);
   return `plan=${tokenInfo.planType || "?"} account=${tokenInfo.accountId || "?"} email=${tokenInfo.email || "?"}`;
@@ -3694,7 +3817,7 @@ async function checkK12WorkspaceMembership(client: any, task: K12Task, accessTok
   }
 }
 
-async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: string, referer = AUTH_WORKSPACE_URL): Promise<string> {
+async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: string, referer = AUTH_WORKSPACE_URL): Promise<string | null> {
   appendLog(task, "info", `auth workspace/select(K12): ${workspaceId}`);
   await runOpenAiAuthRequest<Response>(task, "K12WorkspacePage", () => client.fetch(AUTH_WORKSPACE_URL, {
     method: "GET",
@@ -3722,6 +3845,10 @@ async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: s
   }) as Promise<Response>);
   const text = await response.text().catch(() => "");
   if (!response.ok) {
+    if (isInvalidWorkspaceSelectedResponse(response.status, text)) {
+      appendLog(task, "warn", `auth workspace/select 跳过无效 workspace ${workspaceId.slice(0, 8)}... HTTP ${response.status}: ${text.slice(0, 180)}`);
+      return null;
+    }
     throw new Error(`auth workspace/select(K12) workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`);
   }
   try {
@@ -3845,7 +3972,9 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
       return;
     }
     if (currentUrl === AUTH_WORKSPACE_URL || currentUrl.startsWith(`${AUTH_WORKSPACE_URL}?`)) {
-      currentUrl = await selectK12AuthWorkspace(client, task, workspaceId, currentUrl);
+      const selectedUrl = await selectK12AuthWorkspace(client, task, workspaceId, currentUrl);
+      if (!selectedUrl) return;
+      currentUrl = selectedUrl;
       continue;
     }
     if (currentUrl.startsWith(AUTH_CHOOSE_ACCOUNT_URL)) {
@@ -3903,14 +4032,19 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
   throw new Error(`切换 K12 workspace 跳转次数过多，最后停在 ${safeUrlForLog(currentUrl)}`);
 }
 
-async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, accessToken: string, workspaceId: string): Promise<string> {
-  if (isK12AccessToken(accessToken, task)) return accessToken;
+async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, accessToken: string, workspaceId: string): Promise<string | null> {
+  if (isK12AccessTokenForWorkspace(accessToken, workspaceId)) return accessToken;
 
-  appendLog(task, "warn", `当前 Web AT 仍不是 K12，尝试直接 workspace/select 切到 K12: ${describeAccessTokenContext(accessToken)}`);
+  appendLog(task, "warn", `当前 Web AT 不是目标 K12 workspace，尝试 workspace/select 切换: ${describeAccessTokenContext(accessToken)} -> ${workspaceId.slice(0, 8)}...`);
   try {
     const nextUrl = await selectK12AuthWorkspace(client, task, workspaceId);
+    if (!nextUrl) return null;
     await followK12WorkspaceSelection(client, task, nextUrl);
   } catch (error) {
+    if (isInvalidWorkspaceSelectedError(error)) {
+      appendLog(task, "warn", `auth workspace/select 跳过无效 workspace ${workspaceId.slice(0, 8)}...`);
+      return null;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (!isInvalidAuthStateError(error)) throw error;
     appendLog(task, "warn", "当前 auth session 已失效；改为复用 ChatGPT cookie 刷新 auth session 后直接切 K12");
@@ -3925,30 +4059,36 @@ async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, acces
       task,
       `workspace/select ${workspaceId.slice(0, 8)}... 后 第 ${attempt}/${K12_WORKSPACE_SWITCH_TOKEN_RETRIES} 次`,
     );
-    if (isK12AccessToken(latestToken, task)) return latestToken;
+    if (isK12AccessTokenForWorkspace(latestToken, workspaceId)) return latestToken;
     if (attempt < K12_WORKSPACE_SWITCH_TOKEN_RETRIES) await sleep(1000);
   }
-  appendLog(task, "warn", `workspace/select 后 session AT 仍不是 K12: ${describeAccessTokenContext(latestToken || accessToken)}`);
-  return latestToken || accessToken;
+  appendLog(task, "warn", `workspace/select 后 session AT 仍不是目标 K12 workspace，跳过 ${workspaceId.slice(0, 8)}...: ${describeAccessTokenContext(latestToken || accessToken)}`);
+  return null;
 }
 
 async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessToken: string): Promise<string> {
-  if (isK12AccessToken(accessToken, task)) return accessToken;
+  const joinedIds = successfulK12WorkspaceIds(task);
+  if (joinedIds.some((workspaceId) => isK12AccessTokenForWorkspace(accessToken, workspaceId))) return accessToken;
 
   appendLog(task, "warn", `当前 AT 不是 K12 上下文，不能直接 noRT 入库: ${describeAccessTokenContext(accessToken)}`);
   let latestToken = accessToken;
-  for (const workspaceId of targetK12WorkspaceIds(task)) {
-    const existingOk = task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route && item.ok);
+  for (const workspaceId of joinedIds.length ? joinedIds : targetK12WorkspaceIds(task)) {
+    const existingOk = hasSuccessfulK12WorkspaceResult(task, workspaceId);
     if (!existingOk) {
-      const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
-      task.workspaceResults.push(result);
+      const invite = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+      latestToken = invite.accessToken;
+      task.workspaceResults.push(invite.result);
       await persistTasks();
-      if (!result.ok) continue;
+      if (!invite.result.ok) continue;
     }
     await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
-    latestToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
-    if (isK12AccessToken(latestToken, task)) return latestToken;
-    appendLog(task, "warn", `K12 请求成功后 session AT 仍不是 K12: ${describeAccessTokenContext(latestToken)}`);
+    const switchedToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
+    if (!switchedToken || !isK12AccessTokenForWorkspace(switchedToken, workspaceId)) {
+      appendLog(task, "warn", `noRT 跳过无效 workspace ${workspaceId.slice(0, 8)}...`);
+      continue;
+    }
+    latestToken = switchedToken;
+    return latestToken;
   }
 
   throw new Error(
@@ -4219,18 +4359,155 @@ async function writeAccountJsonFile(
   task: K12Task,
   email: EmailRecord,
   accessToken: string,
-  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string; workspaceId?: string} = {},
 ): Promise<void> {
   if (!accessToken) return;
   const output = buildAccountJsonOutput(task, email, accessToken, options);
   const outDir = resolveJsonOutDir();
   await mkdir(outDir, {recursive: true});
-  const filename = `${output.format}-${sanitizeFileToken(output.accountName || email.email)}.json`;
+  const baseName = sanitizeFileToken(output.accountName || email.email);
+  const wsSuffix = options.workspaceId ? `-${sanitizeFileToken(options.workspaceId.slice(0, 8))}` : "";
+  const filename = `${output.format}-${baseName}${wsSuffix}.json`;
   const filePath = path.join(outDir, filename);
   await writeFile(filePath, `${JSON.stringify(output.data, null, 2)}\n`, "utf8");
   task.jsonOutFile = filePath;
   task.jsonOutFormat = output.format;
+  if (options.workspaceId) {
+    task.jsonOutFiles = task.jsonOutFiles || [];
+    if (!task.jsonOutFiles.includes(filePath)) task.jsonOutFiles.push(filePath);
+  }
   appendLog(task, "ok", `账号 JSON 已写出: ${filePath}`);
+}
+
+interface WorkspaceTokenExport {
+  accessToken: string;
+  workspaceId: string;
+}
+
+function buildWorkspaceAccountName(baseName: string, workspaceId: string): string {
+  return `${baseName}-${sanitizeFileToken(workspaceId.slice(0, 8))}`;
+}
+
+function extractSub2ApiAccountEntry(output: {format: JsonOutFormat; data: unknown}): Record<string, unknown> | null {
+  if (output.format !== "sub2api") return null;
+  const data = output.data as {accounts?: unknown[]};
+  const entry = data.accounts?.[0];
+  return entry && typeof entry === "object" ? entry as Record<string, unknown> : null;
+}
+
+function buildBundledAccountJsonOutput(
+  task: K12Task,
+  email: EmailRecord,
+  entries: WorkspaceTokenExport[],
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): {format: JsonOutFormat; accountName: string; data: unknown} {
+  const format = normalizeJsonOutFormat(tenantState().appConfig.jsonOutFormat);
+  const baseAccountName = firstNonEmpty(
+    options.accountName,
+    task.sub2apiAccount,
+    email.sub2apiAccount,
+    email.email,
+  );
+  const exportedAt = nowIso();
+  const perWorkspaceOutputs = entries.map(({accessToken, workspaceId}) => buildAccountJsonOutput(
+    task,
+    email,
+    accessToken,
+    {
+      ...options,
+      accountName: buildWorkspaceAccountName(baseAccountName, workspaceId),
+    },
+  ));
+
+  if (format === "sub2api") {
+    return {
+      format,
+      accountName: baseAccountName,
+      data: {
+        exported_at: exportedAt,
+        proxies: [],
+        accounts: perWorkspaceOutputs
+          .map((output) => extractSub2ApiAccountEntry(output))
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry)),
+      },
+    };
+  }
+
+  return {
+    format,
+    accountName: baseAccountName,
+    data: {
+      exported_at: exportedAt,
+      email: email.email,
+      workspace_count: entries.length,
+      accounts: perWorkspaceOutputs.map((output) => output.data),
+    },
+  };
+}
+
+async function writeBundledAccountJsonFile(
+  task: K12Task,
+  email: EmailRecord,
+  entries: WorkspaceTokenExport[],
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<void> {
+  if (entries.length < 2) return;
+  const output = buildBundledAccountJsonOutput(task, email, entries, options);
+  const outDir = resolveJsonOutDir();
+  await mkdir(outDir, {recursive: true});
+  const baseName = sanitizeFileToken(output.accountName || email.email);
+  const filename = `${output.format}-${baseName}-bundle.json`;
+  const filePath = path.join(outDir, filename);
+  await writeFile(filePath, `${JSON.stringify(output.data, null, 2)}\n`, "utf8");
+  task.jsonOutBundleFile = filePath;
+  task.jsonOutFile = filePath;
+  task.jsonOutFormat = output.format;
+  task.jsonOutFiles = task.jsonOutFiles || [];
+  if (!task.jsonOutFiles.includes(filePath)) task.jsonOutFiles.push(filePath);
+  appendLog(task, "ok", `多 workspace 合并 JSON 已写出: ${filePath}（${entries.length} 个账号）`);
+}
+
+async function exportK12WorkspaceAccessTokens(
+  client: any,
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  accountOutputOptions: {credentials?: Record<string, unknown>; accountName?: string; source?: string},
+): Promise<string> {
+  const workspaceIds = successfulK12WorkspaceIds(task);
+  if (!workspaceIds.length) {
+    await appendTokenOut(accessToken);
+    await writeAccountJsonFile(task, email, accessToken, accountOutputOptions);
+    return accessToken;
+  }
+  appendLog(task, "info", `多 workspace 导出: 将依次为 ${workspaceIds.length} 个 workspace 切换 AT 并写出 JSON`);
+  let latestToken = accessToken;
+  task.jsonOutFiles = [];
+  const exportedEntries: WorkspaceTokenExport[] = [];
+  for (let index = 0; index < workspaceIds.length; index += 1) {
+    const workspaceId = workspaceIds[index];
+    appendLog(task, "info", `导出 workspace ${index + 1}/${workspaceIds.length}: ${workspaceId.slice(0, 8)}...`);
+    const switchedToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
+    if (!switchedToken || !isK12AccessTokenForWorkspace(switchedToken, workspaceId)) {
+      appendLog(task, "warn", `跳过 workspace ${workspaceId.slice(0, 8)}... 导出: 无法切换 AT`);
+      continue;
+    }
+    latestToken = switchedToken;
+    recordAccessToken(task, email, latestToken);
+    await appendTokenOut(latestToken);
+    exportedEntries.push({accessToken: latestToken, workspaceId});
+    await writeAccountJsonFile(task, email, latestToken, {...accountOutputOptions, workspaceId});
+    if (index < workspaceIds.length - 1) await sleep(tenantState().appConfig.joinIntervalMs);
+  }
+  if (!exportedEntries.length) {
+    appendLog(task, "warn", "所有 workspace 导出均被跳过，保留当前 Web AT");
+    return latestToken;
+  }
+  if (exportedEntries.length === 1) {
+    return latestToken;
+  }
+  await writeBundledAccountJsonFile(task, email, exportedEntries, accountOutputOptions);
+  return latestToken;
 }
 
 async function tryWriteAccountJsonFile(
@@ -6192,23 +6469,44 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
   if (!accessToken) {
     throw new Error("K12 空间执行需要 AT：请启用 Sub2API OAuth，或先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
   }
+  const targetCount = k12WorkspaceJoinTargetCount();
+  const candidatePool = buildK12WorkspaceJoinPool(task);
+  const tried = new Set<string>();
   let latestToken = accessToken;
-  for (const workspaceId of task.workspaceIds) {
+  appendLog(task, "info", `K12 join 目标 ${targetCount} 个 workspace，候选池 ${candidatePool.length} 个`);
+  await ensureChatGptOriginReady(client);
+  latestToken = await readChatGptSessionAccessToken(client, task, "K12 workspace join 前刷新 Web AT");
+  recordAccessToken(task, email, latestToken);
+
+  for (const workspaceId of candidatePool) {
+    if (successfulK12WorkspaceIds(task).length >= targetCount) break;
+    if (tried.has(workspaceId)) continue;
+    tried.add(workspaceId);
     if (hasSuccessfulK12WorkspaceResult(task, workspaceId)) continue;
-    const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
-    task.workspaceResults.push(result);
+
+    const invite = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+    latestToken = invite.accessToken;
+    task.workspaceResults.push(invite.result);
     await persistTasks();
-    if (result.ok) {
+    if (invite.result.ok) {
       await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
-      const switchedToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
-      if (switchedToken !== latestToken) {
-        latestToken = switchedToken;
-        recordAccessToken(task, email, latestToken);
-      }
+      appendLog(task, "ok", `K12 workspace 加入成功 ${successfulK12WorkspaceIds(task).length}/${targetCount}: ${workspaceId.slice(0, 8)}...`);
+    } else {
+      appendLog(task, "warn", `K12 workspace 加入失败，跳过 ${workspaceId.slice(0, 8)}...，继续尝试下一个`);
     }
-    if (task.workspaceIds.length > 1) await sleep(tenantState().appConfig.joinIntervalMs);
+    if (successfulK12WorkspaceIds(task).length < targetCount) {
+      await sleep(tenantState().appConfig.joinIntervalMs);
+    }
   }
-  assertK12WorkspaceJoinSucceeded(task, task.workspaceIds);
+
+  const joinedIds = successfulK12WorkspaceIds(task);
+  task.workspaceIds = joinedIds;
+  assertK12WorkspaceJoinSucceeded(task);
+  if (joinedIds.length < targetCount) {
+    appendLog(task, "warn", `K12 join 结束: 成功 ${joinedIds.length}/${targetCount}，候选池已用尽或剩余 workspace 均失败`);
+  } else {
+    appendLog(task, "ok", `K12 join 完成: 已成功加入 ${joinedIds.length} 个 workspace`);
+  }
   return latestToken;
 }
 
@@ -6375,6 +6673,11 @@ async function runTask(task: K12Task): Promise<void> {
           accountName: task.sub2apiAccount || email.sub2apiAccount,
           source: jsonSource,
         };
+        const joinedWorkspaceIds = successfulK12WorkspaceIds(task);
+        if (task.runWorkspaceJoin && joinedWorkspaceIds.length > 0) {
+          accessToken = await exportK12WorkspaceAccessTokens(client, task, email, accessToken, accountOutputOptions);
+          return;
+        }
         const capture = await tryCapturePlatformShareIfDue(task, email, accessToken, accountOutputOptions);
         if (capture.captured) {
           await handlePlatformFeeCaptured(task, email, accessToken, capture);
@@ -6692,11 +6995,10 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
       skippedRunning += 1;
       continue;
     }
-    const pickedWorkspaceId = pickAvailableWorkspaceId(workspaceCandidates);
-    const taskWorkspaceIds = pickedWorkspaceId ? [pickedWorkspaceId] : [];
+    const candidatePool = shuffleWorkspaceCandidates(workspaceCandidates);
     const task = enqueueK12Task(email, {
       route,
-      workspaceIds: taskWorkspaceIds,
+      workspaceIds: candidatePool,
       runWorkspaceJoin,
       runSub2Api,
       sub2apiNoRtMode,
@@ -6706,7 +7008,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
     appendLog(
       task,
       "info",
-      `已排队: ${email.email}${workspaceCandidates.length > 1 && pickedWorkspaceId ? `，随机 workspace=${pickedWorkspaceId}` : ""}`,
+      `已排队: ${email.email}，workspace 候选 ${candidatePool.length} 个，目标加入 ${tenantState().appConfig.k12WorkspaceExportLimit} 个`,
     );
     created.push(task);
   }

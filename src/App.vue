@@ -229,7 +229,7 @@
                 <span class="pill">{{ workspaceCount }} 个 workspace</span>
               </div>
               <label class="field">
-                <span>K12 Workspace ID（一行一个或逗号分隔；多个时每个邮箱随机选一个）</span>
+                <span>K12 Workspace ID（一行一个或逗号分隔；每个任务最多处理下方设置的数量）</span>
                 <textarea v-model="workspaceText" class="workspace-box"></textarea>
               </label>
               <div class="switch-grid">
@@ -237,7 +237,7 @@
                   <input v-model="form.runWorkspaceJoin" type="checkbox" />
                   <span>
                     <strong>执行 K12 空间脚本</strong>
-                    <small>多个 workspace 时，每个邮箱任务会随机抽取其中一个执行 request/accept。</small>
+                    <small>每个邮箱任务会从 workspace 列表中随机抽取最多 N 个执行 request/accept，并分别导出 JSON。</small>
                   </span>
                 </label>
                 <label class="switch-card">
@@ -270,6 +270,10 @@
                 <label class="field">
                   <span>间隔 ms</span>
                   <input v-model.number="form.joinIntervalMs" type="number" min="0" />
+                </label>
+                <label class="field">
+                  <span>每任务 workspace 数</span>
+                  <input v-model.number="form.k12WorkspaceExportLimit" type="number" min="1" max="20" />
                 </label>
               </div>
               <label class="field">
@@ -1046,6 +1050,7 @@ const form = reactive({
   workspaceIds: [] as string[],
   route: "request",
   joinIntervalMs: 1500,
+  k12WorkspaceExportLimit: 5,
   taskConcurrency: 1,
   runWorkspaceJoin: true,
   runSub2Api: true,
@@ -1230,6 +1235,7 @@ async function loadConfig() {
     workspaceIds: config.workspaceIds || [],
     route: config.route || "request",
     joinIntervalMs: config.joinIntervalMs || 1500,
+    k12WorkspaceExportLimit: config.k12WorkspaceExportLimit ?? 5,
     taskConcurrency: config.taskConcurrency || 1,
     runWorkspaceJoin: config.runWorkspaceJoin !== false,
     runSub2Api: config.runSub2Api !== false,
