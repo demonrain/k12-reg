@@ -1,7 +1,7 @@
 ﻿import {AsyncLocalStorage} from "node:async_hooks";
 import {createHash, randomInt, randomUUID} from "node:crypto";
 import {existsSync} from "node:fs";
-import {mkdir, readFile, rename, stat, unlink, writeFile} from "node:fs/promises";
+import {mkdir, readdir, readFile, rename, stat, unlink, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -840,6 +840,7 @@ async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> 
     }
     reconcileCompletedWorkspaceJoinTasks();
     await hydrateTaskAccessTokensFromTokenOut();
+    await hydrateTaskJsonOutFiles();
     await persistTasks();
     await reconcileAndPersistEmailStatuses();
     tenant.loaded = true;
@@ -7279,6 +7280,204 @@ function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentTy
   res.end(body);
 }
 
+function sendBufferDownload(res: ServerResponse, body: Buffer, filename: string, contentType: string): void {
+  const safeFilename = filename.replace(/[^\w.-]+/g, "_");
+  res.writeHead(200, {
+    "content-type": contentType,
+    "content-disposition": `attachment; filename="${safeFilename}"`,
+    "content-length": String(body.length),
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function crc32Buffer(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (let index = 0; index < data.length; index += 1) {
+    crc ^= data[index];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function createStoreZipArchive(files: Array<{name: string; data: Buffer}>): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() / 2)) & 0xffff;
+  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
+
+  for (const file of files) {
+    const nameBuffer = Buffer.from(file.name, "utf8");
+    const crc = crc32Buffer(file.data);
+    const localHeader = Buffer.alloc(30 + nameBuffer.length);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(dosTime, 10);
+    localHeader.writeUInt16LE(dosDate, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(file.data.length, 18);
+    localHeader.writeUInt32LE(file.data.length, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    nameBuffer.copy(localHeader, 30);
+    localParts.push(localHeader, file.data);
+
+    const centralHeader = Buffer.alloc(46 + nameBuffer.length);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(dosTime, 12);
+    centralHeader.writeUInt16LE(dosDate, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(file.data.length, 20);
+    centralHeader.writeUInt32LE(file.data.length, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+    nameBuffer.copy(centralHeader, 46);
+    centralParts.push(centralHeader);
+    offset += localHeader.length + file.data.length;
+  }
+
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const endRecord = Buffer.alloc(22);
+  endRecord.writeUInt32LE(0x06054b50, 0);
+  endRecord.writeUInt16LE(0, 4);
+  endRecord.writeUInt16LE(0, 6);
+  endRecord.writeUInt16LE(files.length, 8);
+  endRecord.writeUInt16LE(files.length, 10);
+  endRecord.writeUInt32LE(centralSize, 12);
+  endRecord.writeUInt32LE(offset, 16);
+  endRecord.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, ...centralParts, endRecord]);
+}
+
+function isPathWithinDir(filePath: string, dir: string): boolean {
+  const resolved = path.resolve(filePath);
+  const root = path.resolve(dir);
+  return resolved === root || resolved.startsWith(`${root}${path.sep}`);
+}
+
+function collectTaskJsonFilePaths(task: K12Task): string[] {
+  return uniqueStringList([
+    ...(task.jsonOutFiles || []),
+    task.jsonOutFile,
+    task.jsonOutBundleFile,
+  ].map((item) => asString(item)).filter(Boolean));
+}
+
+function taskJsonFileBaseTokens(task: K12Task): string[] {
+  const email = tenantState().emails.find((item) => item.id === task.emailId);
+  return uniqueStringList([
+    sanitizeFileToken(task.sub2apiAccount || email?.sub2apiAccount || ""),
+    sanitizeFileToken(email?.email || task.email),
+  ]).filter(Boolean);
+}
+
+async function discoverTaskJsonFilesOnDisk(task: K12Task): Promise<string[]> {
+  const outDir = resolveJsonOutDir();
+  const entries = await readdir(outDir).catch(() => [] as string[]);
+  const baseTokens = taskJsonFileBaseTokens(task);
+  if (!baseTokens.length) return [];
+
+  const prefixes = baseTokens.flatMap((token) => [`sub2api-${token}`, `cpa-${token}`]);
+  const matched: string[] = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const hit = prefixes.some((prefix) => entry === `${prefix}.json` || entry.startsWith(`${prefix}-`));
+    if (!hit) continue;
+    const filePath = path.join(outDir, entry);
+    if (!isPathWithinDir(filePath, outDir)) continue;
+    matched.push(filePath);
+  }
+  return matched.sort();
+}
+
+async function ensureTaskJsonOutFiles(task: K12Task): Promise<string[]> {
+  const allowedDir = resolveJsonOutDir();
+  const existing = collectTaskJsonFilePaths(task);
+  const validExisting: string[] = [];
+  for (const filePath of existing) {
+    if (!isPathWithinDir(filePath, allowedDir)) continue;
+    const info = await stat(filePath).catch(() => null);
+    if (info?.isFile()) validExisting.push(filePath);
+  }
+  if (validExisting.length) {
+    task.jsonOutFiles = validExisting;
+    task.jsonOutFile = validExisting[validExisting.length - 1];
+    const bundle = validExisting.find((filePath) => path.basename(filePath).includes("-bundle.json"));
+    if (bundle) task.jsonOutBundleFile = bundle;
+    return validExisting;
+  }
+
+  const discovered = await discoverTaskJsonFilesOnDisk(task);
+  if (discovered.length) {
+    task.jsonOutFiles = discovered;
+    task.jsonOutFile = discovered[discovered.length - 1];
+    const bundle = discovered.find((filePath) => path.basename(filePath).includes("-bundle.json"));
+    if (bundle) task.jsonOutBundleFile = bundle;
+  }
+  return discovered;
+}
+
+async function hydrateTaskJsonOutFiles(): Promise<boolean> {
+  let changed = false;
+  for (const task of tenantState().tasks) {
+    if (task.status !== "success" || task.platformFeeCaptured) continue;
+    const before = collectTaskJsonFilePaths(task).join("|");
+    const resolved = await ensureTaskJsonOutFiles(task);
+    const after = resolved.join("|");
+    if (after && after !== before) changed = true;
+  }
+  return changed;
+}
+
+async function loadTaskJsonDownloadFiles(task: K12Task): Promise<Array<{name: string; data: Buffer}>> {
+  const allowedDir = resolveJsonOutDir();
+  const filePaths = await ensureTaskJsonOutFiles(task);
+  const loaded: Array<{name: string; data: Buffer}> = [];
+  const seenNames = new Set<string>();
+  for (const filePath of filePaths) {
+    if (!isPathWithinDir(filePath, allowedDir)) continue;
+    const info = await stat(filePath).catch(() => null);
+    if (!info?.isFile()) continue;
+    const name = path.basename(filePath);
+    if (seenNames.has(name)) continue;
+    seenNames.add(name);
+    loaded.push({name, data: await readFile(filePath)});
+  }
+  return loaded;
+}
+
+async function downloadTaskJsonFiles(task: K12Task, res: ServerResponse): Promise<void> {
+  const before = collectTaskJsonFilePaths(task).join("|");
+  const files = await loadTaskJsonDownloadFiles(task);
+  const after = collectTaskJsonFilePaths(task).join("|");
+  if (after && after !== before) await persistTasks();
+  if (!files.length) {
+    sendJson(res, 404, {error: "该任务没有可下载的 JSON 文件"});
+    return;
+  }
+  const baseName = sanitizeFileToken(task.email || task.id, "task");
+  if (files.length === 1) {
+    sendBufferDownload(res, files[0].data, files[0].name, "application/json; charset=utf-8");
+    return;
+  }
+  sendBufferDownload(res, createStoreZipArchive(files), `${baseName}-json.zip`, "application/zip");
+}
+
 async function serveStatic(url: URL, res: ServerResponse): Promise<boolean> {
   const distDir = path.join(rootDir, "dist");
   const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
@@ -7469,7 +7668,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (method === "GET" && pathname === "/api/tasks") {
-    if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
+    let changed = false;
+    if (await hydrateTaskAccessTokensFromTokenOut()) changed = true;
+    if (await hydrateTaskJsonOutFiles()) changed = true;
+    if (changed) await persistTasks();
     sendJson(res, 200, {items: tenantState().tasks.map(publicTask).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))), count: tenantState().tasks.length});
     return;
   }
@@ -7528,7 +7730,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
-  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|retry|check-at|otp))?$/);
+  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|retry|check-at|otp|download-json))?$/);
   if (taskMatch) {
     const task = tenantState().tasks.find((item) => item.id === decodeURIComponent(taskMatch[1]));
     if (!task) {
@@ -7578,6 +7780,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         sendJson(res, 200, result);
       } catch (error) {
         sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
+      }
+      return;
+    }
+    if (method === "GET" && taskMatch[2] === "download-json") {
+      try {
+        await downloadTaskJsonFiles(task, res);
+      } catch (error) {
+        sendJson(res, 500, {error: error instanceof Error ? error.message : String(error)});
       }
       return;
     }

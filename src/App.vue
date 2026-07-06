@@ -153,7 +153,17 @@
               <td>{{ task.workspaceResults.filter((r) => r.ok).length }}/{{ task.workspaceIds.length }}</td>
               <td>
                 <div class="row-actions">
-                  <button class="ghost small" @click.stop="openTaskLog(task)">日志</button>
+                  <button
+                    class="ghost small"
+                    :disabled="!canDownloadTaskJson(task) || downloadingTaskJsonId === task.id"
+                    @click.stop="downloadTaskJson(task)"
+                  >
+                    {{ downloadingTaskJsonId === task.id ? "下载中" : "JSON" }}
+                  </button>
+                  <button
+                    class="ghost small"
+                    @click.stop="openTaskLog(task)"
+                  >日志</button>
                   <button
                     class="ghost small"
                     :disabled="!canCheckTaskAt(task) || checkingTaskAtId === task.id"
@@ -905,6 +915,8 @@ interface TaskItem {
   accessTokenLivenessCheckedAt?: string;
 	  sub2apiAccount?: string;
 	  jsonOutFile?: string;
+	  jsonOutFiles?: string[];
+	  jsonOutBundleFile?: string;
 	  jsonOutFormat?: string;
 	  platformFeeCaptured?: boolean;
 	  platformFeeCapturedAt?: string;
@@ -1005,6 +1017,7 @@ const importingEmails = ref(false);
 const checkingAccessTokens = ref(false);
 const checkingTasks = ref(false);
 const checkingTaskAtId = ref("");
+const downloadingTaskJsonId = ref("");
 const accessTokenCheckResult = ref("");
 const taskCheckResult = ref("");
 const selectedEmailIds = ref<string[]>([]);
@@ -1873,6 +1886,46 @@ async function loadInactiveTaskData() {
     showToast(`获取失活任务失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     checkingTasks.value = false;
+  }
+}
+
+function canDownloadTaskJson(task: TaskItem): boolean {
+  return task.status === "success" && !task.platformFeeCaptured;
+}
+
+async function downloadTaskJson(task: TaskItem) {
+  if (!canDownloadTaskJson(task)) {
+    showToast("该任务没有可下载的 JSON 文件");
+    return;
+  }
+  downloadingTaskJsonId.value = task.id;
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}/download-json`, {
+      headers: {
+        "x-k12-tenant-id": tenantId,
+      },
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const matched = disposition.match(/filename="?([^"]+)"?/i);
+    const filename = matched?.[1] || `${task.email.replace(/[^\w.-]+/g, "_")}-json.zip`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast(`JSON 下载已开始：${filename}`);
+  } catch (error) {
+    showToast(`JSON 下载失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    downloadingTaskJsonId.value = "";
   }
 }
 
